@@ -35,17 +35,25 @@ def get_all_comments(post_url: str, max_comments: int = 0, cookies=None, headles
 
             page = context.new_page()
             log("باز کردن صفحه پست اینستاگرام...")
-            page.goto(post_url)
+            page.goto(post_url, timeout=60000)
             page.wait_for_timeout(5000)
 
             # پیدا کردن کانتینر کامنت
             container = None
+            is_dialog = False
             for attempt in range(5):
                 log(f"تلاش {attempt+1} برای پیدا کردن کانتینر کامنت...")
-                container = page.query_selector("ul.XQXOT, div[role='dialog'] ul")
+                container = page.query_selector("div[role='dialog'] ul")
                 if container:
-                    log("کانتینر کامنت پیدا شد.")
+                    is_dialog = True
+                    log("کانتینر کامنت در دیالوگ پیدا شد.")
                     break
+
+                container = page.query_selector("main ul")
+                if container:
+                    log("کانتینر کامنت در صفحه اصلی پیدا شد.")
+                    break
+
                 human_sleep(2, 4)
 
             if not container:
@@ -60,35 +68,44 @@ def get_all_comments(post_url: str, max_comments: int = 0, cookies=None, headles
             scroll_attempts = 0
 
             while max_comments == 0 or collected < max_comments:
-                comment_items = container.query_selector_all("li div.C4VMK span, li span")
+                comment_items = container.query_selector_all("ul > li")
                 log(f"{len(comment_items)} کامنت خام یافت شد.")
 
-                for c in comment_items:
-                    text = c.inner_text().strip()
-                    if not text or text in seen:
-                        continue
+                for item in comment_items:
                     try:
-                        parent = c.query_selector("..")
-                        username = parent.query_selector("h3 a").inner_text().strip()
-                    except Exception:
-                        username = "unknown"
+                        # استخراج نام کاربری
+                        username_el = item.query_selector("h3 a, h2 a")
+                        username = username_el.inner_text().strip() if username_el else "unknown"
 
-                    seen.add(text)
-                    collected += 1
-                    result["comments"].append({"username": username, "text": text})
-                    log(f"[{collected}] {username}: {text[:40]}...")
+                        # استخراج متن کامنت
+                        comment_el = item.query_selector("span")
+                        text = comment_el.inner_text().strip() if comment_el else ""
 
-                    if max_comments > 0 and collected >= max_comments:
-                        result["success"] = True
-                        result["count"] = collected
-                        browser.close()
-                        return result
+                        if not text or f"{username}:{text}" in seen:
+                            continue
+
+                        seen.add(f"{username}:{text}")
+                        collected += 1
+                        result["comments"].append({"username": username, "text": text})
+                        log(f"[{collected}] {username}: {text[:40]}...")
+
+                        if max_comments > 0 and collected >= max_comments:
+                            break
+                    except Exception as e:
+                        log(f"خطا در پردازش کامنت: {e}")
+
+                if max_comments > 0 and collected >= max_comments:
+                    break
 
                 # اسکرول کانتینر
-                scroll_height_before = page.evaluate("(el) => el.scrollHeight", container)
-                page.evaluate("(el) => el.scrollBy(0, 500)", container)
+                scroll_target = "document.documentElement"
+                if is_dialog:
+                    scroll_target = "document.querySelector(\"div[role='dialog'] ul\")"
+
+                scroll_height_before = page.evaluate(f"{scroll_target}.scrollHeight")
+                page.evaluate(f"{scroll_target}.scrollBy(0, 500)")
                 human_sleep(1.5, 3.0)
-                scroll_height_after = page.evaluate("(el) => el.scrollHeight", container)
+                scroll_height_after = page.evaluate(f"{scroll_target}.scrollHeight")
 
                 if scroll_height_after == scroll_height_before:
                     scroll_attempts += 1

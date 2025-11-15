@@ -12,7 +12,7 @@ from scraper import get_all_comments
 # -------- تنظیمات --------
 IG_USERNAME = "reza.aghaie4295"
 IG_PASSWORD = "Reza_1388"
-IG_USE_PROXY = True
+IG_USE_PROXY = False
 IG_PROXY = "socks5://127.0.0.1:10808"
 SESSION_FILE = "instagram_session.json"
 
@@ -68,18 +68,18 @@ def try_login(attempts: int = 3) -> Client:
             except:
                 cl.set_proxy(None)
 
-        if os.path.exists(SESSION_FILE) and attempt == 1:
-            try:
-                with open(SESSION_FILE, "r") as f:
-                    settings = json.load(f)
-                cl.set_settings(settings)
-                cl.relogin()
-                print("[Success] لاگین با سشن قبلی")
-                client = cl
-                selenium_cookies = build_web_cookies(cl.get_settings())
-                return cl
-            except Exception as e:
-                print(f"[Session] نامعتبر: {e}")
+        # if os.path.exists(SESSION_FILE) and attempt == 1:
+        #     try:
+        #         with open(SESSION_FILE, "r") as f:
+        #             settings = json.load(f)
+        #         cl.set_settings(settings)
+        #         cl.relogin()
+        #         print("[Success] لاگین با سشن قبلی")
+        #         client = cl
+        #         selenium_cookies = build_web_cookies(cl.get_settings())
+        #         return cl
+        #     except Exception as e:
+        #         print(f"[Session] نامعتبر: {e}")
 
         if os.path.exists(SESSION_FILE) and attempt > 1:
             try:
