@@ -2,286 +2,352 @@ import os
 import json
 import time
 import random
-import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from bs4 import BeautifulSoup
-from webdriver_manager.chrome import ChromeDriverManager
+from instagrapi import Client
+from instagrapi.exceptions import ChallengeRequired, TwoFactorRequired
 
-# -------- تنظیمات --------
-IG_USERNAME = "reza_429593"
+# ========================================================================
+# 🔥 پچ رسمی برای حذف کامل validate پydantic در instagrapi (رفع خطای Media)
+# ========================================================================
+from instagrapi import mixins
+from pydantic import BaseModel
+
+class NoValidateMedia(BaseModel):
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "extra": "allow"
+    }
+
+mixins.media.Media = NoValidateMedia
+# ========================================================================
+
+# ------------------- تنظیمات -------------------
+IG_USERNAME = "fgfgfgfg5623"
 IG_PASSWORD = "reza_1388"
-PROXY = "socks5://127.0.0.1:10808"  # پروکسی SOCKS5 محلی روی 10808
-SESSION_FILE = "instagram_cookies.json"
+
+IG_USE_PROXY = True
+IG_PROXY = "socks5://127.0.0.1:10808"
+
+SESSION_FILE = "instagram_session.json"
 
 app = Flask(__name__)
 CORS(app)
 
-driver = None
-cookies = None
+client = None
+playwright_cookies = []
+challenge_data = {} 
 
-def human_sleep(total=60.0, chunks=6, jitter=2.0):
-    for _ in range(chunks):
-        t = total / chunks + random.uniform(-jitter, jitter)
-        t = max(t, 0.3)
-        print(f"[sleep] {t:.1f}s...")
+
+# ------------------- رفتار انسانی -------------------
+def human_sleep(total_seconds=40, chunks=5, jitter=2):
+    remaining = total_seconds
+    for i in range(chunks):
+        portion = total_seconds / chunks
+        t = max(1, portion + random.uniform(-jitter, jitter))
+        remaining -= t
+        print(f"[sleep] {t:.1f} ثانیه...")
         time.sleep(t)
 
-def setup_driver():
-    global driver
-    options = Options()
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-    
-    # پاک کردن cache
-    options.add_argument('--disable-cache')  # cache رو کامل خاموش کن
-    options.add_argument('--disk-cache-size=1')  # cache size رو 1 بایت کن
-    options.add_argument('--disable-web-security')  # امنیت وب رو موقت خاموش کن
-    options.add_argument('--disable-features=VizDisplayCompositor')  # برای لود سریع‌تر
-    
-    if PROXY:
-        options.add_argument(f'--proxy-server={PROXY}')
-        print(f"[Proxy] SOCKS5 فعال: {PROXY}")
-    else:
-        print("[Proxy] بدون پروکسی")
-    
-    options.headless = False  # False تا ببینی چی می‌شه
-    
-    driver = webdriver.Chrome(service=webdriver.chrome.service.Service(ChromeDriverManager().install()), options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return driver
 
-def clear_cache_and_cookies():
-    """پاک کردن cache و کوکی‌ها (فقط بعد از لود صفحه)"""
-    try:
-        driver.delete_all_cookies()
-        driver.execute_script("if (window.localStorage) { window.localStorage.clear(); }")
-        driver.execute_script("if (window.sessionStorage) { window.sessionStorage.clear(); }")
-        print("[Debug] cache و کوکی‌ها پاک شد")
-    except Exception as e:
-        print(f"[Debug] cache پاک نشد (OK): {e}")
+# ------------------- تبدیل کوکی برای Playwright -------------------
+def inject_client(cl: Client):
+    global playwright_cookies
 
-def handle_cookies_popup():
-    """هندل popup cookies policy IG — Decline optional cookies رو کلیک کن (با JS برای overlay)"""
-    try:
-        # منتظر popup
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'cookies from Instagram')]")))
-        print("[Debug] cookies popup پیدا شد")
-        
-        # Decline optional cookies (اولویت اول، با JS click)
-        try:
-            decline_btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "//button[contains(text(), 'Decline optional cookies')]")))
-            driver.execute_script("arguments[0].click();", decline_btn)
-            print("[Debug] 'Decline optional cookies' با JS کلیک شد")
-        except TimeoutException:
-            # Allow all cookies (جایگزین)
-            try:
-                allow_btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "//button[contains(text(), 'Allow all cookies')]")))
-                driver.execute_script("arguments[0].click();", allow_btn)
-                print("[Debug] 'Allow all cookies' با JS کلیک شد")
-            except TimeoutException:
-                print("[Debug] popup پیدا نشد — ادامه...")
-        
-        # sleep بیشتر بعد از popup (برای animation)
-        human_sleep(8, 4, 2)
-        driver.save_screenshot("after_cookies.png")
-        print("[Debug] popup بسته شد — screenshot: after_cookies.png")
-    except TimeoutException:
-        print("[Debug] هیچ cookies popup پیدا نشد — OK")
-        pass
+    cookies = cl.get_settings().get("cookies", {})
+    pw = []
 
-def test_proxy():
-    """تست ساده پروکسی — برو به اینستاگرام و چک کن لود می‌شه"""
-    try:
-        driver.get("https://www.instagram.com")
-        time.sleep(5)
-        title = driver.title
-        print(f"[Proxy Test] صفحه لود شد: {title[:50]}...")
-        if "Instagram" in title:
-            clear_cache_and_cookies()  # cache رو بعد از لود پاک کن
-            driver.save_screenshot("proxy_test_ok.png")
-            return True
-        else:
-            raise Exception("صفحه درست لود نشد")
-    except Exception as e:
-        print(f"[Proxy Test Failed] {e}")
-        driver.save_screenshot("proxy_test_error.png")
-        return False
+    for name, obj in cookies.items():
+        pw.append({
+            "name": name,
+            "value": obj.get("value"),
+            "domain": ".instagram.com",
+            "path": "/",
+            "httpOnly": True,
+            "secure": True
+        })
 
-def login_instagram():
-    global driver, cookies
-    if os.path.exists(SESSION_FILE):
-        try:
-            driver = setup_driver()
-            driver.get("https://www.instagram.com")
-            time.sleep(3)
-            stored_cookies = json.load(open(SESSION_FILE))
-            for cookie in stored_cookies:
-                driver.add_cookie(cookie)
-            driver.refresh()
-            time.sleep(5)
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
-            print("[Success] لاگین با کوکی‌های قبلی موفق")
-            cookies = stored_cookies
-            return True
-        except Exception as e:
-            print(f"[Session] کوکی‌ها نامعتبر: {e} — لاگین جدید")
-            driver.save_screenshot("session_error.png")
-            if os.path.exists(SESSION_FILE):
-                os.remove(SESSION_FILE)
-    
-    driver = setup_driver()
+    playwright_cookies = pw
+    print(f"[inject_client] {len(pw)} کوکی منتقل شد")
+
+
+# ------------------- ارسال کد چالش به ایمیل -------------------
+def send_email_security_code(cl: Client, cp_path: str):
+    print("[Challenge] درخواست ارسال کد به ایمیل...")
     try:
-        # تست پروکسی اول
-        if not test_proxy():
-            print("[Error] پروکسی کار نمی‌کنه — xray/v2ray رو چک کن و دوباره اجرا کن")
-            return False
-        
-        driver.get("https://www.instagram.com/accounts/login/")
-        clear_cache_and_cookies()  # cache رو بعد از لود پاک کن
-        print("[Debug] صفحه لاگین لود شد — screenshot: login_page.png")
-        driver.save_screenshot("login_page.png")
-        
-        # هندل cookies popup اول (مهم!)
-        handle_cookies_popup()
-        
-        # username (loop با visibility)
-        print("[Debug] جستجو برای username input...")
-        username_input = None
-        for i in range(8):  # 8 بار امتحان (۴۰ ثانیه)
-            try:
-                username_input = WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.NAME, "username")))
-                driver.execute_script("arguments[0].scrollIntoView(true);", username_input)  # اسکرول به فیلد
-                break
-            except TimeoutException:
-                print(f"[Debug] username فیلد در تلاش {i+1} پیدا نشد — sleep...")
-                human_sleep(5, 2, 1)
-        
-        if not username_input:
-            raise Exception("username فیلد پیدا نشد")
-        
-        username_input.clear()
-        username_input.send_keys(IG_USERNAME)
-        print("[Debug] username وارد شد")
-        human_sleep(2, 2, 0.5)
-        
-        # password
-        print("[Debug] جستجو برای password input...")
-        password_input = None
-        for i in range(8):  # 8 بار امتحان
-            try:
-                password_input = WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.NAME, "password")))
-                driver.execute_script("arguments[0].scrollIntoView(true);", password_input)
-                break
-            except TimeoutException:
-                print(f"[Debug] password فیلد در تلاش {i+1} پیدا نشد — sleep...")
-                human_sleep(5, 2, 1)
-        
-        if not password_input:
-            raise Exception("password فیلد پیدا نشد")
-        
-        password_input.clear()
-        password_input.send_keys(IG_PASSWORD)
-        print("[Debug] password وارد شد")
-        human_sleep(2, 2, 0.5)
-        
-        # login button (با JS click)
-        print("[Debug] جستجو برای login button...")
-        login_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']")))
-        driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", login_button)
-        print("[Debug] دکمه لاگین با JS کلیک شد")
-        human_sleep(8, 4, 2)
-        
-        # هندل popup بعد از لاگین
-        handle_cookies_popup()
-        
-        # چک موفقیت
-        print("[Debug] چک لود صفحه اصلی...")
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
-        
-        cookies = driver.get_cookies()
-        with open(SESSION_FILE, "w") as f:
-            json.dump(cookies, f)
-        
-        print("[Success] لاگین موفق — کوکی‌ها ذخیره شد")
+        cl.challenge_send_method(cp_path, choice="email")
+        print("[Challenge] کد به ایمیل ارسال شد ✔")
         return True
-        
     except Exception as e:
-        print(f"[Error] لاگین ناموفق در مرحله: {e}")
-        driver.save_screenshot("login_error.png")
-        print("صفحه ارور رو چک کن (login_error.png)")
-        if driver:
-            driver.quit()
+        print(f"[Challenge] ارسال ایمیل نشد: {e}")
         return False
 
-def get_all_comments(post_url, max_comments=100):
-    if not driver:
-        return {"success": False, "error": "not logged in"}
-    
-    driver.get(post_url)
-    human_sleep(8, 4, 2)
-    
-    comments = []
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    
-    while len(comments) < max_comments:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        human_sleep(4, 3, 1)
-        
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        comment_elements = soup.find_all('div', class_=re.compile(r'^_a9zs|_acan'))
-        
-        for el in comment_elements:
-            text = el.get_text(strip=True)
-            if text and len(text) > 1 and text not in comments:
-                comments.append(text)
-                if len(comments) >= max_comments:
-                    break
-        
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            print(f"[Info] همه کامنت‌ها لود شد ({len(comments)} تا)")
-            break
-        last_height = new_height
-    
-    return {"success": True, "comments": comments[:max_comments]}
 
-# -------- لاگین اولیه --------
-print("[Start] شروع لاگین با Selenium...")
-if not login_instagram():
-    print("[FATAL] لاگین نشد — screenshotها رو چک کن و اکانت/اینترنت رو تست کن")
-    exit(1)
-print("[Success] Selenium آماده — سرور شروع شد")
+# ------------------- لاگین -------------------
+def try_login(attempts=3):
+    global client, challenge_data
 
-# -------- API --------
-@app.route('/status', methods=['GET'])
+    for attempt in range(1, attempts + 1):
+        print(f"[Login] تلاش {attempt}/{attempts}")
+
+        cl = Client()
+        cl.delay_range = [5, 10]
+
+        if IG_USE_PROXY:
+            cl.set_proxy(IG_PROXY)
+            print(f"[Proxy] فعال: {IG_PROXY}")
+        else:
+            cl.set_proxy(None)
+
+        if os.path.exists(SESSION_FILE) and attempt == 1:
+            try:
+                cl.load_settings(SESSION_FILE)
+                cl.relogin()
+                client = cl
+                inject_client(cl)
+                print("[Login] موفق با session موجود ✔")
+                return cl
+            except Exception as e:
+                print("[Warning] session خراب بود:", e)
+
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
+            print("[Session] پاک شد → device جدید ساخته می‌شود")
+
+        human_sleep(random.uniform(20, 60))
+
+        try:
+            cl.login(IG_USERNAME, IG_PASSWORD)
+
+            cl.dump_settings(SESSION_FILE)
+            client = cl
+            inject_client(cl)
+
+            print("[Success] لاگین کامل ✔")
+            return cl
+
+        except ChallengeRequired:
+            print("[Challenge] ChallengeRequired دریافت شد")
+
+            cp_path = cl.last_json.get("challenge", {}).get("api_path")
+            if not cp_path:
+                print("[Challenge] api_path پیدا نشد!")
+                return None
+
+            challenge_data["cp_path"] = cp_path
+            challenge_data["cl"] = cl
+
+            send_email_security_code(cl, cp_path)
+
+            print("[Challenge] منتظر ارسال کد هستیم...")
+            return "CHALLENGE"
+
+        except TwoFactorRequired:
+            print("[2FA] فعال است → پشتیبانی نمی‌شود")
+            return None
+
+        except Exception as e:
+            print(f"[Error] لاگین نشد: {e}")
+            time.sleep(random.uniform(5, 15))
+
+    return None
+
+
+# ------------------- شروع لاگین اولیه -------------------
+print("[Rocket] شروع لاگین اولیه …")
+try_login()
+
+
+# ------------------- API ها -------------------
+@app.route("/status", methods=["GET"])
 def status():
-    return jsonify({"logged_in": bool(cookies), "proxy": PROXY})
+    return jsonify({
+        "logged_in": bool(client),
+        "session_exists": os.path.exists(SESSION_FILE)
+    })
 
-@app.route('/get-comments', methods=['POST'])
-def get_comments_route():
-    data = request.get_json() or {}
-    post_url = data.get('post_url', '').strip()
-    max_comments = int(data.get('max_comments', 100))
-    
-    if not post_url or not re.search(r'instagram\.com/(p|reel|tv)/[A-Za-z0-9_-]+', post_url):
-        return jsonify({"success": False, "error": "invalid_url"}), 400
-    
-    print(f"[API] جمع‌آوری {max_comments} کامنت از {post_url}")
-    result = get_all_comments(post_url, max_comments)
-    return jsonify(result)
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    print(f"[Server] http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+@app.route("/send-code-again", methods=["POST"])
+def resend_code():
+    if "cl" not in challenge_data:
+        return jsonify({"success": False, "error": "No active challenge"}), 400
+
+    cl = challenge_data["cl"]
+    cp_path = challenge_data["cp_path"]
+
+    ok = send_email_security_code(cl, cp_path)
+    return jsonify({"success": ok})
+
+
+@app.route("/submit-code", methods=["POST"])
+def submit_code():
+    global client
+
+    data = request.json or {}
+    code = data.get("code", "").strip()
+
+    if "cl" not in challenge_data:
+        return jsonify({"success": False, "error": "No active challenge"}), 400
+
+    cl = challenge_data["cl"]
+    cp_path = challenge_data["cp_path"]
+
+    try:
+        print(f"[Challenge] ارسال کد: {code}")
+        result = cl.challenge_send_security_code(code)
+
+        if result:
+            print("[Challenge] کد صحیح بود → لاگین کامل ✔")
+
+            cl.dump_settings(SESSION_FILE)
+            client = cl
+            inject_client(cl)
+
+            return jsonify({"success": True})
+
+        else:
+            return jsonify({"success": False, "error": "wrong code"}), 400
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+# ========================================================================
+# 🔥 مسیر جدید: گرفتن کامنت با Playwright بدون خطای Pydantic و با سشن واقعی
+# ========================================================================
+import random
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+def get_all_comments(post_url: str, max_comments: int = 0, cookies=None, user_agent=None, headless=False, proxy: str = None):
+    if cookies is None:
+        cookies = []
+
+    result = {"success": False, "post_url": post_url, "comments": [], "count": 0}
+
+    try:
+        print("[SCRAPER] شروع فرایند اسکرپینگ...")
+        with sync_playwright() as p:
+            browser_args = {}
+            if proxy:
+                browser_args["proxy"] = {"server": proxy}
+                print(f"[SCRAPER] استفاده از پروکسی: {proxy}")
+
+            browser = p.chromium.launch(headless=headless, **browser_args)
+            context_args = {}
+            if user_agent:
+                context_args["user_agent"] = user_agent
+            context = browser.new_context(**context_args)
+
+            if cookies:
+                print(f"[SCRAPER] اضافه کردن {len(cookies)} کوکی...")
+                context.add_cookies(cookies)
+
+            page = context.new_page()
+            try:
+                page.goto(post_url, timeout=60000)
+                page.wait_for_timeout(5000)
+            except PlaywrightTimeoutError as e:
+                print(f"[SCRAPER] خطا در باز کردن پست: {e}")
+                result["error"] = str(e)
+                browser.close()
+                return result
+
+            container = None
+            is_dialog = False
+            for attempt in range(10):
+                container = page.query_selector("div[role='dialog'] ul")
+                if container:
+                    is_dialog = True
+                    break
+                container = page.query_selector("main ul")
+                if container:
+                    break
+                time.sleep(random.uniform(1.5, 3.0))
+
+            if not container:
+                result["error"] = "comments_container_not_found"
+                browser.close()
+                return result
+
+            seen = set()
+            collected = 0
+            scroll_attempts = 0
+
+            while max_comments == 0 or collected < max_comments:
+                comment_items = container.query_selector_all("ul > li")
+                for item in comment_items:
+                    try:
+                        username_el = item.query_selector("h3 a, h2 a")
+                        username = username_el.inner_text().strip() if username_el else "unknown"
+                        comment_el = item.query_selector("span")
+                        text = comment_el.inner_text().strip() if comment_el else ""
+
+                        if not text or f"{username}:{text}" in seen:
+                            continue
+
+                        seen.add(f"{username}:{text}")
+                        collected += 1
+                        result["comments"].append({"username": username, "text": text})
+
+                        if max_comments > 0 and collected >= max_comments:
+                            break
+                    except:
+                        continue
+
+                if max_comments > 0 and collected >= max_comments:
+                    break
+
+                scroll_target = "document.documentElement"
+                if is_dialog:
+                    scroll_target = "document.query_selector('div[role=\"dialog\"] ul')"
+
+                scroll_height_before = page.evaluate(f"{scroll_target}.scrollHeight")
+                page.evaluate(f"{scroll_target}.scrollBy(0, 500)")
+                time.sleep(random.uniform(1.5, 3.0))
+                scroll_height_after = page.evaluate(f"{scroll_target}.scrollHeight")
+
+                if scroll_height_after == scroll_height_before:
+                    scroll_attempts += 1
+                    if scroll_attempts >= 3:
+                        break
+                else:
+                    scroll_attempts = 0
+
+            result["success"] = True
+            result["count"] = collected
+            browser.close()
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+@app.route("/get-comments-playwright", methods=["POST"])
+def get_comments_playwright():
+    data = request.json or {}
+    post_url = data.get("url", "").strip()
+    max_comments = int(data.get("max_comments", 50))
+
+    cookies = []
+    user_agent = None
+    if client:
+        cookies = [
+            {"name": k, "value": v.get("value"), "domain": ".instagram.com", "path": "/", "httpOnly": True, "secure": True}
+            for k, v in client.get_settings().get("cookies", {}).items()
+        ]
+        user_agent = client.user_agent
+
+    return get_all_comments(
+        post_url,
+        max_comments=max_comments,
+        cookies=cookies,
+        user_agent=user_agent,
+        headless=False,
+        proxy=IG_PROXY
+    )
+
+
+# ------------------- RUN -------------------
+if __name__ == "__main__":
+    print("[Server] http://0.0.0.0:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)

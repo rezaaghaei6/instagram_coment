@@ -1,7 +1,10 @@
 # scraper.py
 import time
 import random
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 
 LOG_PREFIX = "[SCRAPER-LOG]"
 
@@ -15,7 +18,7 @@ def human_sleep(min_s=1.0, max_s=3.0):
 
 def sanitize_cookies(cookies):
     """
-    تبدیل کوکی‌ها به فرمت صحیح Playwright
+    تبدیل کوکی‌ها به فرمت Selenium
     """
     valid_cookies = []
     for c in cookies:
@@ -32,9 +35,10 @@ def sanitize_cookies(cookies):
         valid_cookies.append(cookie)
     return valid_cookies
 
-def get_all_comments(post_url: str, max_comments: int = 0, cookies=None, headless=True, proxy: str = None):
+def get_all_comments(post_url: str, max_comments: int = 0, cookies=None, user_agent=None, headless=True, proxy: str = None):
     """
-    جمع‌آوری کامنت‌ها با Playwright و اسکرول روی کانتینر
+    جمع‌آوری کامنت‌ها با Selenium
+    cookies + user_agent → از session واقعی instagrapi
     """
     if cookies is None:
         cookies = []
@@ -42,111 +46,106 @@ def get_all_comments(post_url: str, max_comments: int = 0, cookies=None, headles
     result = {"success": False, "post_url": post_url, "comments": [], "count": 0}
 
     try:
-        log("شروع فرایند اسکرپینگ...")
-        with sync_playwright() as p:
-            browser_args = {}
-            if proxy:
-                browser_args["proxy"] = {"server": proxy}
-                log(f"[Proxy] استفاده می‌شود: {proxy}")
+        log("شروع فرایند اسکرپینگ با Selenium...")
 
-            browser = p.chromium.launch(headless=headless, **browser_args)
-            context = browser.new_context()
+        chrome_options = Options()
+        if headless:
+            chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-infobars")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--log-level=3")
 
-            # اضافه کردن کوکی‌ها
-            if cookies:
-                log(f"در حال اضافه کردن {len(cookies)} کوکی معتبر...")
-                context.add_cookies(sanitize_cookies(cookies))
+        if user_agent:
+            chrome_options.add_argument(f"user-agent={user_agent}")
 
-            page = context.new_page()
-            log("باز کردن صفحه پست اینستاگرام...")
-            try:
-                page.goto(post_url, timeout=60000)
-                page.wait_for_timeout(5000)
-            except PlaywrightTimeoutError as e:
-                log(f"❌ خطای بحرانی در باز کردن پست: {e}")
-                result["error"] = str(e)
-                browser.close()
-                return result
+        if proxy:
+            chrome_options.add_argument(f"--proxy-server={proxy}")
+            log(f"[Proxy] استفاده می‌شود: {proxy}")
 
-            # پیدا کردن کانتینر کامنت با تلاش چندباره
-            container = None
-            is_dialog = False
-            for attempt in range(10):
-                log(f"تلاش {attempt+1} برای پیدا کردن کانتینر کامنت...")
-                container = page.query_selector("div[role='dialog'] ul")
-                if container:
-                    is_dialog = True
-                    log("کانتینر کامنت در دیالوگ پیدا شد.")
-                    break
-                container = page.query_selector("main ul")
-                if container:
-                    log("کانتینر کامنت در صفحه اصلی پیدا شد.")
-                    break
-                human_sleep(2, 4)
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(60)
 
-            if not container:
-                log("❌ کانتینر کامنت پیدا نشد، پایان اسکرپینگ")
-                result["error"] = "comments_container_not_found"
-                browser.close()
-                return result
+        # باز کردن صفحه اصلی اینستاگرام برای set کردن کوکی‌ها
+        driver.get("https://www.instagram.com/")
+        human_sleep(2, 4)
 
-            # اسکرول روی کانتینر و جمع‌آوری کامنت‌ها
-            seen = set()
-            collected = 0
-            scroll_attempts = 0
+        # اضافه کردن کوکی‌ها
+        if cookies:
+            log(f"در حال اضافه کردن {len(cookies)} کوکی معتبر...")
+            for c in sanitize_cookies(cookies):
+                try:
+                    driver.add_cookie(c)
+                except Exception as e:
+                    log(f"خطا در اضافه کردن کوکی: {e}")
 
-            while max_comments == 0 or collected < max_comments:
-                comment_items = container.query_selector_all("ul > li")
-                log(f"{len(comment_items)} کامنت خام یافت شد.")
+        # باز کردن صفحه پست
+        driver.get(post_url)
+        human_sleep(3, 5)
 
-                for item in comment_items:
-                    try:
-                        # استخراج نام کاربری
-                        username_el = item.query_selector("h3 a, h2 a")
-                        username = username_el.inner_text().strip() if username_el else "unknown"
+        # پیدا کردن کانتینر کامنت
+        try:
+            container = driver.find_element(By.CSS_SELECTOR, "ul.XQXOT")  # کانتینر کامنت در پست‌ها
+        except NoSuchElementException:
+            log("❌ کانتینر کامنت پیدا نشد")
+            result["error"] = "comments_container_not_found"
+            driver.quit()
+            return result
 
-                        # استخراج متن کامنت
-                        comment_el = item.query_selector("span")
-                        text = comment_el.inner_text().strip() if comment_el else ""
+        seen = set()
+        collected = 0
+        scroll_attempts = 0
 
-                        if not text or f"{username}:{text}" in seen:
-                            continue
+        while max_comments == 0 or collected < max_comments:
+            comment_items = container.find_elements(By.CSS_SELECTOR, "li")
+            log(f"{len(comment_items)} کامنت خام یافت شد.")
 
-                        seen.add(f"{username}:{text}")
-                        collected += 1
-                        result["comments"].append({"username": username, "text": text})
-                        log(f"[{collected}] {username}: {text[:40]}...")
+            for item in comment_items:
+                try:
+                    username_el = item.find_element(By.CSS_SELECTOR, "h3 a")
+                    username = username_el.text.strip()
+                    comment_el = item.find_element(By.CSS_SELECTOR, "span")
+                    text = comment_el.text.strip()
 
-                        if max_comments > 0 and collected >= max_comments:
-                            break
-                    except Exception as e:
-                        log(f"خطا در پردازش کامنت: {e}")
+                    if not text or f"{username}:{text}" in seen:
+                        continue
 
-                if max_comments > 0 and collected >= max_comments:
-                    break
+                    seen.add(f"{username}:{text}")
+                    collected += 1
+                    result["comments"].append({"username": username, "text": text})
+                    log(f"[{collected}] {username}: {text[:40]}...")
 
-                # اسکرول کانتینر
-                scroll_target = "document.documentElement"
-                if is_dialog:
-                    scroll_target = "document.querySelector(\"div[role='dialog'] ul\")"
-
-                scroll_height_before = page.evaluate(f"{scroll_target}.scrollHeight")
-                page.evaluate(f"{scroll_target}.scrollBy(0, 500)")
-                human_sleep(1.5, 3.0)
-                scroll_height_after = page.evaluate(f"{scroll_target}.scrollHeight")
-
-                if scroll_height_after == scroll_height_before:
-                    scroll_attempts += 1
-                    if scroll_attempts >= 3:
-                        log("اسکرول به انتها رسید، پایان جمع‌آوری کامنت‌ها")
+                    if max_comments > 0 and collected >= max_comments:
                         break
-                else:
-                    scroll_attempts = 0
+                except Exception as e:
+                    log(f"خطا در پردازش کامنت: {e}")
 
-            result["success"] = True
-            result["count"] = collected
-            browser.close()
+            if max_comments > 0 and collected >= max_comments:
+                break
 
+            # اسکرول به پایین کانتینر
+            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", container)
+            human_sleep(1.5, 3.0)
+
+            # بررسی پایان اسکرول
+            new_height = driver.execute_script("return arguments[0].scrollHeight", container)
+            if new_height == 0 or scroll_attempts >= 5:
+                log("اسکرول به انتها رسید")
+                break
+            scroll_attempts += 1
+
+        result["success"] = True
+        result["count"] = collected
+        driver.quit()
+
+    except TimeoutException as e:
+        log(f"❌ Timeout در باز کردن پست: {e}")
+        result["error"] = str(e)
+    except WebDriverException as e:
+        log(f"❌ خطای WebDriver: {e}")
+        result["error"] = str(e)
     except Exception as e:
         log(f"❌ خطای بحرانی: {e}")
         result["error"] = str(e)
